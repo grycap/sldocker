@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+
+function usage() {
+    cat <<EOT
+
+usage:
+    sldocker [ -n <num> ] [ -r ] <src1> <src2> <dst>
+
+    Gets <num> layers from docker image src2 and adds them to src1. The resulting docker image
+      is registered as <dst>
+
+	-n <num> 	- number of last layers to add from docker image src2 to docker 
+                          image src1. Default: 1
+	-r              - remove <dst> docker image if exists
+	
+EOT
+    exit 1
+}
+
+function ensure_exists() {
+    local COUNT="$(docker images -q "$1" | wc -l)"
+    if ((COUNT==0)); then
+        docker pull $1 || exit 1
+        COUNT="$(docker images -q "$1" | wc -l)"
+    fi
+    if ((COUNT==1)); then
+        return 0
+    fi
+    return 1
+}
+
+function tempdir() {
+    local FNAME="./$RANDOM"
+    
+    while ! mkdir -p "$FNAME"; do
+        FNAME="./$RANDOM"
+    done
+
+    echo "$FNAME"
+}
+
+DEBUG=0
+set -o pipefail
+NUMLAYERS=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+	-h)	usage; exit 0;;
+        -n)     shift; NUMLAYERS=$1;;
+        -w)     shift; WFOLDER="$1"; NORM=true;;
+        -r)     REMOVEIFEXISTS=1;;
+        *)
+            [ "$IMG_SRC1" == "" ] && IMG_SRC1="$1" && shift && continue
+            [ "$IMG_SRC2" == "" ] && IMG_SRC2="$1" && shift && continue
+            [ "$IMG_DST" == "" ] && IMG_DST="$1" && shift && continue
+            usage;;
+    esac
+    shift
+done
+
+[ "$IMG_SRC1" == "" ] && usage
+[ "$IMG_SRC2" == "" ] && usage
+[ "$IMG_DST" == "" ] && usage
+[[ ! "$NUMLAYERS" =~ ^[0-9]+$ ]] && usage
+
+if [ "$WFOLDER" != "" ]; then
+    cd "$WFOLDER"
+else
+    WFOLDER="$(tempdir)"
+    cd "$WFOLDER"
+    mkdir img1
+    echo "saving and extracting $IMG_SRC1"
+    if ! ensure_exists "$IMG_SRC1"; then
+        echo "could not get information about image $IMG_SRC1"
+        exit 1
+    fi
+    if ! ensure_exists "$IMG_SRC2"; then
+        echo "could not get information about image $IMG_SRC2"
+        exit 1
+    fi
+    if ! (docker save "$IMG_SRC1" 2> /dev/null | tar x -C img1); then
+        echo "failed to save and extract $IMG_SRC1"
+        exit 1
+    fi
+    mkdir img2
+    echo "saving and extracting $IMG_SRC2"
+    if ! (docker save "$IMG_SRC2" 2> /dev/null | tar x -C img2); then
+        echo "failed to save and extract $IMG_SRC2"
+    fi
+fi
+
+MANIFEST_1="$(cat img1/manifest.json 2> /dev/null)"
+MANIFEST_2="$(cat img2/manifest.json 2> /dev/null)"
+
+LAYERS_1="$(echo "$MANIFEST_1" | jq -r '.[] | .Layers | .[]')"
+LAYERS_2="$(echo "$MANIFEST_2" | jq -r '.[] | .Layers | .[]')"
+N_LAYERS_2="$(echo "$LAYERS_2" | wc -l)"
+
+if ((NUMLAYERS > N_LAYERS_2)); then
+    echo "not enough layers in image $IMG_SRC2"
+    exit 1
+fi
+
+NEWLAYERS="$(echo "$LAYERS_2" | tail -n $NUMLAYERS)"
+
+echo -n "adding layers to $IMG_SRC1: "
+NEWLAYERS_S=
+DIFFIDS_S=
+for i in $NEWLAYERS; do
+    NEWLAYERS_S="$NEWLAYERS_S,\"$i\""
+    SUM="$(sha256sum "img2/$i")"
+    DIFFIDS_S="$DIFFIDS_S,\"sha256:${SUM%% *}\""
+    FOLDER_LAYER="$(dirname $i)"
+    echo -n "$FOLDER_LAYER "
+    if ! cp -r img2/$FOLDER_LAYER img1; then
+        echo "failed to copy layer $FOLDER_LAYER"
+        exit 1
+    fi
+done
+echo
+
+NEWLAYERS_S="${NEWLAYERS_S:1}"
+DIFFIDS_S="${DIFFIDS_S:1}"
+
+# Now hack the manifest and so on
+
+IMGID="$(uuidgen | sha256sum)"
+IMGID="${IMGID%% *}"
+
+echo "$MANIFEST_1" | jq "[ .[] | .Layers += [ $NEWLAYERS_S ] | .RepoTags = [ \"$IMG_DST\" ] ]" > "img1/manifest.json"
+CONFIGFILE_1="img1/$(echo "$MANIFEST_1" | jq -r ".[] | .Config")"
+CONFIG_1="$(cat $CONFIGFILE_1)"
+
+echo "$CONFIG_1" | jq "del(.history)|del(.container_config)|del(.container)|.config.Image=\"sha256:$IMGID\"|.created=(now|todate)|.rootfs.diff_ids+=[$DIFFIDS_S]" > "$CONFIGFILE_1"
+
+if [ "$REMOVEIFEXISTS" == "1" ]; then
+    RES="$(docker images -q "$IMG_DST" 2> /dev/null | wc -l)"
+    if ((RES==1)); then
+        OLDTAG="$RANDOM:$RANDOM"
+        echo "trying to remove existing image $IMG_DST"
+        if ! (docker tag $IMG_DST $OLDTAG && docker rmi $IMG_DST 2> /dev/null); then
+            echo "could not remove existing image $IMG_DST"
+            exit 1
+        fi
+    fi
+    if ((RES>1)); then
+        echo "cowardly refusing to delete images $(docker images -q IMG_DST)"
+        exit 1
+    fi
+fi
+
+echo "importing image $IMG_DST"
+docker load < <(tar c -C img1 .)
+
+[ "$OLDTAG" != "" ] && docker rmi $OLDTAG > /dev/null
+
+cd - > /dev/null
+[ "$NORM" != "true" ] && rm -rf "$WFOLDER"
